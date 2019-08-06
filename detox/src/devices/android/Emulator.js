@@ -24,11 +24,14 @@ class Emulator {
     return (await exec(`${this.emulatorBin} ${cmd}`)).stdout;
   }
 
-  async boot(emulatorName) {
+  async boot(emulatorName, options = {port: undefined, readOnly: false}) {
     const emulatorArgs = _.compact([
       '-verbose',
       '-no-audio',
+      '-no-boot-anim',
       argparse.getArgValue('headless') ? '-no-window' : '',
+      options.port ? `-s ${options.port}` : '',
+      options.readOnly ? '-read-only' : '',
       `@${emulatorName}`
     ]);
 

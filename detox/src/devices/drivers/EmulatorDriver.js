@@ -1,49 +1,54 @@
 const _ = require('lodash');
 const path = require('path');
-const Emulator = require('../android/Emulator');
-const EmulatorTelnet = require('../android/EmulatorTelnet');
-const DetoxRuntimeError = require('../../errors/DetoxRuntimeError');
-const Environment = require('../../utils/environment');
-const retry = require('../../utils/retry');
-const sleep = require('../../utils/sleep');
-const AndroidDriver = require('./AndroidDriver');
 const ini = require('ini');
 const fs = require('fs');
 const os = require('os');
+const Emulator = require('../android/Emulator');
+const EmulatorTelnet = require('../android/EmulatorTelnet');
+const DetoxRuntimeError = require('../../errors/DetoxRuntimeError');
+const environment = require('../../utils/environment');
+const retry = require('../../utils/retry');
+const AndroidDriver = require('./AndroidDriver');
+const DeviceRegistry = require('../DeviceRegistry');
+
+const DetoxEmulatorsPortRange = {
+  min: 10000,
+  max: 20000
+};
 
 class EmulatorDriver extends AndroidDriver {
   constructor(config) {
     super(config);
 
     this.emulator = new Emulator();
+    this.deviceRegistry = new DeviceRegistry({
+      getDeviceIdsByType: this._getDeviceIdsByType.bind(this),
+      createDevice: this._createDevice.bind(this),
+      lockfile: environment.getDeviceLockFilePathAndroid(),
+    });
+    this.pendingBoots = {};
   }
 
-  async _fixEmulatorConfigIniSkinName(name) {
-    const configFile = `${os.homedir()}/.android/avd/${name}.avd/config.ini`;
-    const config = ini.parse(fs.readFileSync(configFile, 'utf-8'));
+  async acquireFreeDevice(avdName) {
+    await this._validateAvd(avdName);
+    await this._fixEmulatorConfigIniSkinNameIfNeeded(avdName);
 
-    if (!config['skin.name']) {
-      const width = config['hw.lcd.width'];
-      const height = config['hw.lcd.height'];
+    const adbName = await this.deviceRegistry.getDevice(avdName);
+    await this._bootIfNeeded(avdName, adbName);
 
-      if (width === undefined || height === undefined) {
-        throw new Error(`Emulator with name ${name} has a corrupt config.ini file (${configFile}), try fixing it by recreating an emulator.`);
-      }
+    await this.adb.apiLevel(adbName);
+    await this.adb.unlockScreen(adbName);
 
-      config['skin.name'] = `${width}x${height}`;
-      fs.writeFileSync(configFile, ini.stringify(config));
-    }
-    return config;
+    return adbName;
   }
 
-  async boot(avdName) {
-    let adbName = await this._findADBNameByAVDName(avdName, { strict: false });
-    const coldBoot = adbName == null;
+  async _bootIfNeeded(avdName, adbName) {
+    const coldBoot = !!this.pendingBoots[adbName];
 
     // If it's not already running, start it now.
     if (coldBoot) {
-      await this.emulator.boot(avdName);
-      adbName = await this._findADBNameByAVDName(avdName, { strict: true });
+      await this.emulator.boot(avdName, {port: this.pendingBoots[adbName]});
+      delete this.pendingBoots[adbName];
     }
 
     await this._waitForBootToComplete(adbName);
@@ -52,34 +57,13 @@ class EmulatorDriver extends AndroidDriver {
     return adbName;
   }
 
-  async _findADBNameByAVDName(avdName, { strict }) {
-    const adbDevices = await this.adb.devices();
-    const filteredDevices = _.filter(adbDevices, {type: 'emulator', name: avdName});
-
-    if (filteredDevices.length === 1) {
-      return filteredDevices[0].adbName;
-    }
-
-    if (filteredDevices.length > 1) {
-      throw new Error(`Got more than one device corresponding to the name: ${avdName}`);
-    }
-
-    if (strict) {
-      throw new Error(`Could not find '${avdName}' on the currently ADB attached devices, 
-      try restarting adb 'adb kill-server && adb start-server'`);
-    }
-
-    return null;
-  }
-
-  async acquireFreeDevice(avdName) {
+  async _validateAvd(avdName) {
     const avds = await this.emulator.listAvds();
-
     if (!avds) {
-      const avdmanagerPath = path.join(Environment.getAndroidSDKPath(), 'tools', 'bin', 'avdmanager');
+      const avdmanagerPath = path.join(environment.getAndroidSDKPath(), 'tools', 'bin', 'avdmanager');
 
       throw new Error(`Could not find any configured Android Emulator. 
-      Try creating a device first, example: ${avdmanagerPath} create avd --force --name Nexus_5X_API_24 --abi x86 --package 'system-images;android-24;google_apis_playstore;x86' --device "Nexus 5X"
+      Try creating a device first, example: ${avdmanagerPath} create avd --force --name Pixel_2_API_26 --abi x86 --package 'system-images;android-26;google_apis_playstore;x86' --device "Pixel 2"
       or go to https://developer.android.com/studio/run/managing-avds.html for details on how to create an Emulator.`);
     }
 
@@ -87,14 +71,6 @@ class EmulatorDriver extends AndroidDriver {
       throw new Error(`Can not boot Android Emulator with the name: '${avdName}',
       make sure you choose one of the available emulators: ${avds.toString()}`);
     }
-
-    await this._fixEmulatorConfigIniSkinName(avdName);
-
-    const adbName = await this.boot(avdName);
-    await this.adb.apiLevel(adbName);
-    await this.adb.unlockScreen(adbName);
-
-    return adbName;
   }
 
   async _waitForBootToComplete(deviceId) {
@@ -116,6 +92,45 @@ class EmulatorDriver extends AndroidDriver {
     await telnet.connect(port);
     await telnet.kill();
     await this.emitter.emit('shutdownDevice', { deviceId });
+  }
+
+  async _fixEmulatorConfigIniSkinNameIfNeeded(avdName) {
+    const configFile = `${os.homedir()}/.android/avd/${avdName}.avd/config.ini`;
+    const config = ini.parse(fs.readFileSync(configFile, 'utf-8'));
+
+    if (!config['skin.name']) {
+      const width = config['hw.lcd.width'];
+      const height = config['hw.lcd.height'];
+
+      if (width === undefined || height === undefined) {
+        throw new Error(`Emulator with name ${avdName} has a corrupt config.ini file (${configFile}), try fixing it by recreating an emulator.`);
+      }
+
+      config['skin.name'] = `${width}x${height}`;
+      fs.writeFileSync(configFile, ini.stringify(config));
+    }
+    return config;
+  }
+
+  async _getDeviceIdsByType(name) {
+    const device = await this.adb.findDevice((candidate) => {
+      return (candidate.name === name && this.deviceRegistry.isBusy(candidate.adbName));
+    });
+
+    if (device) {
+      return device.adbName;
+    }
+    return undefined;
+  }
+
+  async _createDevice() {
+    const {min, max} = DetoxEmulatorsPortRange;
+    let port = Math.random() * (max - min) + min;
+    port = port & (~0 - 1);
+
+    const adbName = `emulator-${port}`;
+    this.pendingBoots[adbName] = port;
+    return adbName;
   }
 }
 
